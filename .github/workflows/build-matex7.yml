@@ -1,0 +1,175 @@
+
+name: Build FlClash Mate X7
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
+
+    steps:
+      - name: Checkout exact FlClash release
+        uses: actions/checkout@v4
+        with:
+          repository: tljk/FlClash-ohos
+          ref: v0.8.99+2026112001
+          submodules: false
+
+      - name: Download Mihomo submodule
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive --depth 1
+
+      - name: Apply Mate X7 modifications
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          bundle = "com.personal.flclash.matex7"
+
+          app_file = Path("ohos/AppScope/app.json5")
+          app = json.loads(app_file.read_text())
+          assert app["app"]["bundleName"] == "com.follow.clash"
+          app["app"]["bundleName"] = bundle
+          app_file.write_text(json.dumps(app, indent=2, ensure_ascii=False) + "\n")
+
+          module_file = Path("ohos/entry/src/main/module.json5")
+          data = json.loads(module_file.read_text())
+
+          blocked = {
+              "ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM",
+              "ohos.permission.READ_PASTEBOARD",
+              "ohos.permission.USE_FRAUD_APP_PICKER",
+          }
+
+          permissions = data["module"]["requestPermissions"]
+          assert sum(p["name"] in blocked for p in permissions) == 3
+
+          data["module"]["requestPermissions"] = [
+              p for p in permissions if p["name"] not in blocked
+          ]
+
+          for ability in data["module"]["abilities"]:
+              if "backgroundModes" in ability:
+                  modes = [
+                      x for x in ability["backgroundModes"]
+                      if x != "taskKeeping"
+                  ]
+                  if modes:
+                      ability["backgroundModes"] = modes
+                  else:
+                      del ability["backgroundModes"]
+
+          module_file.write_text(
+              json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+          )
+
+          base = Path("ohos/entry/src/main/ets")
+
+          entry_file = base / "entryability/EntryAbility.ets"
+          entry = entry_file.read_text()
+
+          old_import = "import { antifraudPicker } from '@kit.DeviceSecurityKit'\n"
+          assert entry.count(old_import) == 1
+          entry = entry.replace(old_import, "")
+
+          pattern = (
+              r"  handleGetPackages\(result: MethodResult\): Promise<void> "
+              r"\{.*?\n  \}\n\n  handleInit\("
+          )
+
+          replacement = (
+              "  handleGetPackages(result: MethodResult): Promise<void> {\n"
+              "    result.success('[]')\n"
+              "    return Promise.resolve()\n"
+              "  }\n\n"
+              "  handleInit("
+          )
+
+          entry, count = re.subn(pattern, replacement, entry, flags=re.S)
+          assert count == 1
+          entry_file.write_text(entry)
+
+          notify = base / "managers/NotificationManager.ets"
+          notify.write_text(
+              "import { common } from '@kit.AbilityKit'\n"
+              "export default class NotificationManager {\n"
+              "  constructor(_context: common.UIAbilityContext) {}\n"
+              "  subscribe(): Promise<void> {\n"
+              "    return Promise.resolve()\n"
+              "  }\n"
+              "  unsubscribe(): Promise<void> {\n"
+              "    return Promise.resolve()\n"
+              "  }\n"
+              "}\n"
+          )
+
+          widget_file = base / "widget/pages/WidgetCard.ets"
+          widget = widget_file.read_text()
+
+          old = "bundleName: 'com.follow.clash'"
+          new = f"bundleName: '{bundle}'"
+
+          assert widget.count(old) == 2
+          widget_file.write_text(widget.replace(old, new))
+
+          print("Mate X7 source modifications applied successfully")
+          PY
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+
+      - name: Setup OpenHarmony Go
+        run: |
+          git clone -b v0.1.0 --depth 1 \
+            https://github.com/DreamistW/go-ohos-port.git \
+            "$RUNNER_TEMP/go-ohos-port"
+
+          python3 "$RUNNER_TEMP/go-ohos-port/scripts/prepare-toolchain.py" \
+            "$RUNNER_TEMP/ohos-go"
+
+          echo "GOROOT=$RUNNER_TEMP/ohos-go/go" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/ohos-go/go/bin" >> "$GITHUB_PATH"
+
+      - name: Setup OpenHarmony SDK
+        uses: ErBWs/setup-ohos@v2.0.0
+        with:
+          version: 26.0.0.821
+
+      - name: Setup Flutter OHOS
+        uses: tljk/flutter-action@main
+        with:
+          channel: oh-3.47.7-preview
+          flutter-version: 3.47.7+ohos-0.0.1-pre
+          git-source: https://gitcode.com/CPF-Flutter/flutter_flutter.git
+
+      - name: Apply upstream Flutter compatibility patch
+        run: bash .github/revert_flutter_ohos.sh
+
+      - name: Setup Rust
+        run: rustup target add aarch64-unknown-linux-ohos
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build unsigned HAP
+        run: dart setup.dart ohos --env pre -v
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-MateX7-unsigned
+          path: dist/*.hap
+          if-no-files-found: error
